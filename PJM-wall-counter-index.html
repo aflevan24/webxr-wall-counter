@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>WebXR Wall Counter</title>
+  <style>
+    :root { --bg: #0b0f14; --fg: #e6edf3; --muted: #9aa4ad; --accent: #70e1ff; }
+    html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+    #overlay { position: fixed; inset: 0; pointer-events: none; display: grid; grid-template-rows: auto 1fr auto; padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom); }
+    .topbar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: rgba(0,0,0,0.3); border-radius: 14px; width: fit-content; margin: 8px; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 22px var(--accent); }
+    #count { font-weight: 700; }
+    .hint { color: var(--muted); font-size: 13px; margin-left: 6px; }
+    #log { align-self: end; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: rgba(0,0,0,0.35); border-radius: 12px; padding: 8px 10px; margin: 12px; max-height: 35vh; overflow: auto; pointer-events: auto; }
+    #enter { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #111923; color: var(--fg); border: 1px solid #22303d; padding: 14px 18px; border-radius: 14px; cursor: pointer; font-weight: 600; box-shadow: 0 8px 30px rgba(0,0,0,0.35); }
+    #unsupported { position: fixed; inset: 0; display: none; place-items: center; text-align: center; padding: 28px; color: var(--fg); }
+    a { color: var(--accent); }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <div class="topbar">
+      <div class="dot"></div>
+      <div>Walls detected: <span id="count">0</span></div>
+      <div class="hint" id="status">Move your phone slowly. Look around the whole room.</div>
+    </div>
+    <div></div>
+    <div id="log"></div>
+  </div>
+  <button id="enter">Start AR</button>
+  <div id="unsupported"></div>
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.161.0/build/three.module.js';
+    const logEl = document.getElementById('log');
+    const countEl = document.getElementById('count');
+    const statusEl = document.getElementById('status');
+    const enterBtn = document.getElementById('enter');
+    const unsupported = document.getElementById('unsupported');
+    const supportsXR = navigator.xr && typeof navigator.xr.isSessionSupported === 'function';
+    function log(msg) {
+      console.log(msg);
+      logEl.textContent = (msg + '\n' + logEl.textContent).slice(0, 4000);
+    }
+    if (!supportsXR) {
+      unsupported.style.display = 'grid';
+      unsupported.innerHTML = `<div><h2>WebXR not available</h2><p>Your browser doesn't support WebXR. On iOS, use Safari on iOS 17+ (WebXR may require enabling in Settings ▸ Safari ▸ Advanced ▸ Feature Flags). On Android, use Chrome 81+.</p></div>`;
+      enterBtn.style.display = 'none';
+    }
+    let renderer, scene, camera, xrRefSpace;
+    let planes = new Map();
+    function buildPlaneMesh(xrPlane) {
+      const poly = Array.from(xrPlane.polygon || []);
+      if (poly.length < 3) return null;
+      const shape = new THREE.Shape();
+      for (let i = 0; i < poly.length; i++) {
+        const p = poly[i];
+        if (i === 0) shape.moveTo(p.x, p.y); else shape.lineTo(p.x, p.y);
+      }
+      const geom = new THREE.ShapeGeometry(shape);
+      const mat = new THREE.MeshBasicMaterial({ color: 0x70e1ff, opacity: 0.18, transparent: true, side: THREE.DoubleSide });
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.frustumCulled = false;
+      return mesh;
+    }
+    async function start() {
+      const supported = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+      if (!supported) {
+        unsupported.style.display = 'grid';
+        unsupported.innerHTML = `<div><h2>AR not supported</h2><p>Your device/browser doesn't support <code>immersive-ar</code>. Try Chrome on Android or Safari iOS 17+ with WebXR enabled.</p></div>`;
+        enterBtn.style.display = 'none';
+        return;
+      }
+      const session = await navigator.xr.requestSession('immersive-ar', {
+        requiredFeatures: ['local', 'hit-test'],
+        optionalFeatures: ['plane-detection', 'dom-overlay', 'anchors'],
+        domOverlay: { root: document.getElementById('overlay') }
+      }).catch(err => { log('requestSession error: ' + err); return null; });
+      if (!session) return;
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.xr.enabled = true;
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(window.devicePixelRatio);
+      document.body.appendChild(renderer.domElement);
+      await renderer.xr.setSession(session);
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera();
+      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+      xrRefSpace = await session.requestReferenceSpace('local');
+      session.requestAnimationFrame(onXRFrame);
+      session.addEventListener('end', () => {
+        if (renderer) {
+          renderer.dispose();
+          renderer.domElement.remove();
+        }
+      });
+    }
+    function onXRFrame(time, frame) {
+      const session = frame.session;
+      session.requestAnimationFrame(onXRFrame);
+      const pose = frame.getViewerPose(xrRefSpace);
+      if (!pose) return;
+      const worldInfo = frame.worldInformation || frame.worldInformation;
+      const detected = (worldInfo && worldInfo.detectedPlanes) ? worldInfo.detectedPlanes : null;
+      if (detected) {
+        statusEl.textContent = 'Scanning...';
+        for (const xrPlane of detected) {
+          const orientation = xrPlane.orientation || xrPlane.planeSpace?.orientation;
+          if (orientation && orientation !== 'vertical') continue;
+          let mesh = planes.get(xrPlane);
+          if (!mesh) {
+            mesh = buildPlaneMesh(xrPlane) || new THREE.Mesh(new THREE.CircleGeometry(0.25, 24), new THREE.MeshBasicMaterial({ color: 0x70e1ff, opacity: 0.2, transparent: true }));
+            mesh.matrixAutoUpdate = false;
+            planes.set(xrPlane, mesh);
+            scene.add(mesh);
+          }
+          const planePose = frame.getPose(xrPlane.planeSpace || xrPlane, xrRefSpace);
+          if (planePose) {
+            const m = new THREE.Matrix4().fromArray(planePose.transform.matrix);
+            mesh.matrix.copy(m);
+          }
+        }
+        for (const [xrPlane, mesh] of Array.from(planes.entries())) {
+          if (!detected.has(xrPlane)) {
+            scene.remove(mesh);
+            planes.delete(xrPlane);
+          }
+        }
+        countEl.textContent = [...planes.keys()].length.toString();
+      } else {
+        statusEl.textContent = 'Plane detection not available; counting disabled.';
+      }
+      renderer.render(scene, camera);
+    }
+    enterBtn.addEventListener('click', () => start());
+    window.addEventListener('resize', () => {
+      if (!renderer) return;
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
